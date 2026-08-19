@@ -1,4 +1,3 @@
-
 import os, sqlite3, time
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, Response, g
@@ -86,21 +85,71 @@ def load_models():
     if not os.path.exists(YUNET) or not os.path.exists(SFACE):
         print("Models not found. Run download_models.py")
         return False
-    detector = cv2.FaceDetectorYN.create(YUNET, "", (320,320), 0.85, 0.3, 5000)
+    detector = cv2.FaceDetectorYN.create(YUNET, "", (320,320), 0.55, 0.3, 5000)
     recognizer = cv2.FaceRecognizerSF.create(SFACE, "")
     return True
 
 def extract_face(image):
+    # Registration uploads may come from phones/browsers and can be large.
+    # Keep the original image for alignment, but give YuNet a reasonable size.
     if detector is None or recognizer is None or image is None:
         return None, 0
+
+    if len(image.shape) != 3 or image.shape[2] != 3:
+        return None, 0
+
     h, w = image.shape[:2]
-    detector.setInputSize((w, h))
-    _, faces = detector.detect(image)
-    if faces is None: return None, 0
-    faces = sorted(faces, key=lambda x: x[2]*x[3], reverse=True)
-    aligned = recognizer.alignCrop(image, faces[0])
-    feature = recognizer.feature(aligned).astype(np.float32)
-    return feature, len(faces)
+    if h < 80 or w < 80:
+        return None, 0
+
+    # Improve detection reliability for portrait/mobile uploads.
+    work = image
+    max_side = 1600
+    if max(h, w) > max_side:
+        scale = max_side / float(max(h, w))
+        work = cv2.resize(image, (int(w * scale), int(h * scale)),
+                          interpolation=cv2.INTER_AREA)
+
+    wh, ww = work.shape[:2]
+    detector.setInputSize((ww, wh))
+    _, faces = detector.detect(work)
+
+    if faces is None or len(faces) == 0:
+        # Retry after mild histogram normalization for difficult lighting.
+        gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        retry = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        detector.setInputSize((ww, wh))
+        _, faces = detector.detect(retry)
+
+    if faces is None or len(faces) == 0:
+        return None, 0
+
+    faces = sorted(faces, key=lambda x: x[2] * x[3], reverse=True)
+
+    # Map the detected box back to the original image when it was resized.
+    face = faces[0].copy()
+    if work is not image:
+        scale_x = w / float(ww)
+        scale_y = h / float(wh)
+        face[0] *= scale_x
+        face[1] *= scale_y
+        face[2] *= scale_x
+        face[3] *= scale_y
+        # YuNet landmark coordinates are also included in the row.
+        if len(face) >= 14:
+            for i in range(4, len(face), 2):
+                face[i] *= scale_x
+                if i + 1 < len(face):
+                    face[i + 1] *= scale_y
+
+    try:
+        aligned = recognizer.alignCrop(image, face)
+        feature = recognizer.feature(aligned).astype(np.float32)
+        return feature, len(faces)
+    except Exception as exc:
+        print(f"Face alignment/feature extraction failed: {exc}")
+        return None, len(faces)
 
 def normalize_feature(feature):
     feature = np.asarray(feature, dtype=np.float32).reshape(1, -1)
@@ -335,14 +384,26 @@ def register():
     if len(photos)>MAX_REG_PHOTOS: return jsonify(error=f"Maximum {MAX_REG_PHOTOS} photos allowed."),400
 
     features=[]
+    detection_errors=[]
     for photo in photos:
         image=cv2.imdecode(np.frombuffer(photo.read(),np.uint8),cv2.IMREAD_COLOR)
-        if image is None: continue
+        if image is None:
+            detection_errors.append(f"{photo.filename}: invalid image")
+            continue
         feature,count=extract_face(image)
         if feature is not None and count==1:
             features.append(normalize_feature(feature).astype(np.float32))
+        elif count > 1:
+            detection_errors.append(f"{photo.filename}: multiple faces detected")
+        else:
+            detection_errors.append(f"{photo.filename}: face not detected")
+
     if not features:
-        return jsonify(error="No valid face found. Use clear photos with exactly one face."),400
+        # Give Render logs enough information to diagnose model/detection issues.
+        print("Registration failed:", "; ".join(detection_errors))
+        if detector is None or recognizer is None:
+            return jsonify(error="Face models are not loaded on the server. Check the models folder and Render deployment."),500
+        return jsonify(error="Face not detected. Upload a clear, front-facing photo with exactly one person. If the photo works locally but not on Render, check Render logs for the model-loading message."),400
 
     # Average several enrollment images for a more stable primary template.
     avg=normalize_feature(np.mean(np.vstack(features),axis=0))
